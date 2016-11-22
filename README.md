@@ -1,5 +1,20 @@
-# Video cache support for Android
-[![Android Arsenal](https://img.shields.io/badge/Android%20Arsenal-AndroidVideoCache-brightgreen.svg?style=flat)](http://android-arsenal.com/details/1/1751)
+## Video cache support for Android
+[![Android Arsenal](https://img.shields.io/badge/Android%20Arsenal-AndroidVideoCache-brightgreen.svg?style=flat)](http://android-arsenal.com/details/1/1751) [![Build Status](https://api.travis-ci.org/danikula/AndroidVideoCache.svg?branch=master)](https://travis-ci.org/danikula/AndroidVideoCache/) [ ![Download](https://api.bintray.com/packages/alexeydanilov/maven/videocache/images/download.svg) ](https://bintray.com/alexeydanilov/maven/videocache/_latestVersion)
+
+## Table of Content
+- [Why AndroidVideoCache?](#why-androidvideocache)
+- [Features](#features)
+- [Get started](#get-started)
+- [Recipes](#recipes)
+  - [Disk cache limit](#disk-cache-limit)
+  - [Listen caching progress](#listen-caching-progress)
+  - [Sample](#sample)
+- [Known problems](#known-problems)
+- [Whats new](#whats-new)
+- [Code contributions](#code-contributions)
+- [Where published?](#where-published)
+- [Questions?](#questions)
+- [License](#license)
 
 ## Why AndroidVideoCache?
 Because there is no sense to download video a lot of times while streaming!
@@ -14,14 +29,14 @@ Because there is no sense to download video a lot of times while streaming!
 
 Note `AndroidVideoCache` works only with **direct urls** to media file, it  [**doesn't support**](https://github.com/danikula/AndroidVideoCache/issues/19) any streaming technology like DASH, SmoothStreaming, HLS.  
 
-## How to use?
+## Get started
 Just add dependency (`AndroidVideoCache` is available in jcenter):
 ```
 repositories {
     jcenter()
 }
 dependencies {
-    compile 'com.danikula:videocache:2.3.4'
+    compile 'com.danikula:videocache:2.6.3'
 }
 ```
 
@@ -64,6 +79,8 @@ public class App extends Application {
 or use [simple factory](http://pastebin.com/s2fafSYS).
 More preferable way is use some dependency injector like [Dagger](http://square.github.io/dagger/).
 
+## Recipes
+### Disk cache limit
 By default `HttpProxyCacheServer` uses 512Mb for caching files. You can change this value:
 
 ```java
@@ -82,9 +99,20 @@ private HttpProxyCacheServer newProxy() {
             .maxCacheFilesCount(20)
             .build();
 }
-``` 
+```
 
-See `sample` app for details.
+### Listen caching progress
+Use `HttpProxyCacheServer.registerCacheListener(CacheListener listener)` method to set listener with callback `onCacheAvailable(File cacheFile, String url, int percentsAvailable)` to be aware of caching progress. Do not forget to to unsubscribe listener with help of `HttpProxyCacheServer.unregisterCacheListener(CacheListener listener)` method to avoid memory leaks.
+
+Use `HttpProxyCacheServer.isCached(String url)` method to check was url's content fully cached to file or not.
+
+See `sample` app for more details.
+
+### Sample
+See `sample` app.
+
+## Known problems
+`AndroidVideoCache` [doesn't work](https://github.com/danikula/AndroidVideoCache/issues/28) if wifi or mobile internet connection uses proxy.
 
 ## Whats new
 See Release Notes [here](https://github.com/danikula/AndroidVideoCache/releases)
@@ -94,9 +122,11 @@ If it's a feature that you think would need to be discussed please open an issue
 
 1. [Fork the project](http://help.github.com/fork-a-repo/)
 2. Create a feature branch (git checkout -b my_branch)
-3. Push your changes to your new branch (git push origin my_branch)
-4. Initiate a [pull request](http://help.github.com/send-pull-requests/) on github
-5. Your pull request will be reviewed and hopefully merged :)
+3. Fix a problem. Your code **must** contain test for reproducing problem. Your tests **must be passed** with help of your fix
+4. Push your changes to your new branch (git push origin my_branch)
+5. Initiate a [pull request](http://help.github.com/send-pull-requests/) on github
+6. Rebase [master branch](https://github.com/danikula/AndroidVideoCache) if your local branch is not actual. Merging is not acceptable, only rebase
+6. Your pull request will be reviewed and hopefully merged :)
 
 ## Where published?
 [Here](https://bintray.com/alexeydanilov/maven/videocache/view)
@@ -106,7 +136,7 @@ If it's a feature that you think would need to be discussed please open an issue
 
 ## License
 
-    Copyright 2014-2015 Alexey Danilov
+    Copyright 2014-2016 Alexey Danilov
 
     Licensed under the Apache License, Version 2.0 (the "License");
     you may not use this file except in compliance with the License.

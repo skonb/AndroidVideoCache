@@ -1,7 +1,12 @@
 package com.danikula.videocache;
 
 import android.text.TextUtils;
-import android.util.Log;
+
+import com.danikula.videocache.sourcestorage.SourceInfoStorage;
+import com.danikula.videocache.sourcestorage.SourceInfoStorageFactory;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.BufferedInputStream;
 import java.io.IOException;
@@ -10,8 +15,8 @@ import java.io.InterruptedIOException;
 import java.net.HttpURLConnection;
 import java.net.URL;
 
+import static com.danikula.videocache.Preconditions.checkNotNull;
 import static com.danikula.videocache.ProxyCacheUtils.DEFAULT_BUFFER_SIZE;
-import static com.danikula.videocache.ProxyCacheUtils.LOG_TAG;
 import static java.net.HttpURLConnection.HTTP_MOVED_PERM;
 import static java.net.HttpURLConnection.HTTP_MOVED_TEMP;
 import static java.net.HttpURLConnection.HTTP_OK;
@@ -25,52 +30,56 @@ import static java.net.HttpURLConnection.HTTP_SEE_OTHER;
  */
 public class HttpUrlSource implements Source {
 
+    private static final Logger LOG = LoggerFactory.getLogger("HttpUrlSource");
+
     private static final int MAX_REDIRECTS = 5;
-    public final String url;
+    private final SourceInfoStorage sourceInfoStorage;
+    private SourceInfo sourceInfo;
     private HttpURLConnection connection;
     private InputStream inputStream;
-    private volatile int length = Integer.MIN_VALUE;
-    private volatile String mime;
 
     public HttpUrlSource(String url) {
-        this(url, ProxyCacheUtils.getSupposablyMime(url));
+        this(url, SourceInfoStorageFactory.newEmptySourceInfoStorage());
     }
 
-    public HttpUrlSource(String url, String mime) {
-        this.url = Preconditions.checkNotNull(url);
-        this.mime = mime;
+    public HttpUrlSource(String url, SourceInfoStorage sourceInfoStorage) {
+        this.sourceInfoStorage = checkNotNull(sourceInfoStorage);
+        SourceInfo sourceInfo = sourceInfoStorage.get(url);
+        this.sourceInfo = sourceInfo != null ? sourceInfo :
+                new SourceInfo(url, Integer.MIN_VALUE, ProxyCacheUtils.getSupposablyMime(url));
     }
 
     public HttpUrlSource(HttpUrlSource source) {
-        this.url = source.url;
-        this.mime = source.mime;
-        this.length = source.length;
+        this.sourceInfo = source.sourceInfo;
+        this.sourceInfoStorage = source.sourceInfoStorage;
     }
 
     @Override
     public synchronized int length() throws ProxyCacheException {
-        if (length == Integer.MIN_VALUE) {
+        if (sourceInfo.length == Integer.MIN_VALUE) {
             fetchContentInfo();
         }
-        return length;
+        return sourceInfo.length;
     }
 
     @Override
     public void open(int offset) throws ProxyCacheException {
         try {
             connection = openConnection(offset, -1);
-            mime = connection.getContentType();
+            String mime = connection.getContentType();
             inputStream = new BufferedInputStream(connection.getInputStream(), DEFAULT_BUFFER_SIZE);
-            length = readSourceAvailableBytes(connection, offset, connection.getResponseCode());
+            int length = readSourceAvailableBytes(connection, offset, connection.getResponseCode());
+            this.sourceInfo = new SourceInfo(sourceInfo.url, length, mime);
+            this.sourceInfoStorage.put(sourceInfo.url, sourceInfo);
         } catch (IOException e) {
-            throw new ProxyCacheException("Error opening connection for " + url + " with offset " + offset, e);
+            throw new ProxyCacheException("Error opening connection for " + sourceInfo.url + " with offset " + offset, e);
         }
     }
 
     private int readSourceAvailableBytes(HttpURLConnection connection, int offset, int responseCode) throws IOException {
         int contentLength = connection.getContentLength();
         return responseCode == HTTP_OK ? contentLength
-                : responseCode == HTTP_PARTIAL ? contentLength + offset : length;
+                : responseCode == HTTP_PARTIAL ? contentLength + offset : sourceInfo.length;
     }
 
     @Override
@@ -78,10 +87,11 @@ public class HttpUrlSource implements Source {
         if (connection != null) {
             try {
                 connection.disconnect();
-            } catch (NullPointerException e) {
-                // https://github.com/danikula/AndroidVideoCache/issues/32
-                // https://github.com/danikula/AndroidVideoCache/issues/29
-                throw new ProxyCacheException("Error disconnecting HttpUrlConnection", e);
+            } catch (NullPointerException | IllegalArgumentException e) {
+                String message = "Wait... but why? WTF!? " +
+                        "Really shouldn't happen any more after fixing https://github.com/danikula/AndroidVideoCache/issues/43. " +
+                        "If you read it on your device log, please, notify me danikula@gmail.com or create issue here https://github.com/danikula/AndroidVideoCache/issues.";
+                throw new RuntimeException(message, e);
             }
         }
     }
@@ -89,29 +99,31 @@ public class HttpUrlSource implements Source {
     @Override
     public int read(byte[] buffer) throws ProxyCacheException {
         if (inputStream == null) {
-            throw new ProxyCacheException("Error reading data from " + url + ": connection is absent!");
+            throw new ProxyCacheException("Error reading data from " + sourceInfo.url + ": connection is absent!");
         }
         try {
             return inputStream.read(buffer, 0, buffer.length);
         } catch (InterruptedIOException e) {
-            throw new InterruptedProxyCacheException("Reading source " + url + " is interrupted", e);
+            throw new InterruptedProxyCacheException("Reading source " + sourceInfo.url + " is interrupted", e);
         } catch (IOException e) {
-            throw new ProxyCacheException("Error reading data from " + url, e);
+            throw new ProxyCacheException("Error reading data from " + sourceInfo.url, e);
         }
     }
 
     private void fetchContentInfo() throws ProxyCacheException {
-        Log.d(LOG_TAG, "Read content info from " + url);
+        LOG.debug("Read content info from " + sourceInfo.url);
         HttpURLConnection urlConnection = null;
         InputStream inputStream = null;
         try {
             urlConnection = openConnection(0, 10000);
-            length = urlConnection.getContentLength();
-            mime = urlConnection.getContentType();
+            int length = urlConnection.getContentLength();
+            String mime = urlConnection.getContentType();
             inputStream = urlConnection.getInputStream();
-            Log.i(LOG_TAG, "Content info for `" + url + "`: mime: " + mime + ", content-length: " + length);
+            this.sourceInfo = new SourceInfo(sourceInfo.url, length, mime);
+            this.sourceInfoStorage.put(sourceInfo.url, sourceInfo);
+            LOG.debug("Source info fetched: " + sourceInfo);
         } catch (IOException e) {
-            Log.e(LOG_TAG, "Error fetching info from " + url, e);
+            LOG.error("Error fetching info from " + sourceInfo.url, e);
         } finally {
             ProxyCacheUtils.close(inputStream);
             if (urlConnection != null) {
@@ -124,9 +136,9 @@ public class HttpUrlSource implements Source {
         HttpURLConnection connection;
         boolean redirected;
         int redirectCount = 0;
-        String url = this.url;
+        String url = this.sourceInfo.url;
         do {
-            Log.d(LOG_TAG, "Open connection " + (offset > 0 ? " with offset " + offset : "") + " to " + url);
+            LOG.debug("Open connection " + (offset > 0 ? " with offset " + offset : "") + " to " + url);
             connection = (HttpURLConnection) new URL(url).openConnection();
             if (offset > 0) {
                 connection.setRequestProperty("Range", "bytes=" + offset + "-");
@@ -150,18 +162,18 @@ public class HttpUrlSource implements Source {
     }
 
     public synchronized String getMime() throws ProxyCacheException {
-        if (TextUtils.isEmpty(mime)) {
+        if (TextUtils.isEmpty(sourceInfo.mime)) {
             fetchContentInfo();
         }
-        return mime;
+        return sourceInfo.mime;
     }
 
     public String getUrl() {
-        return url;
+        return sourceInfo.url;
     }
 
     @Override
     public String toString() {
-        return "HttpUrlSource{url='" + url + "}";
+        return "HttpUrlSource{sourceInfo='" + sourceInfo + "}";
     }
 }

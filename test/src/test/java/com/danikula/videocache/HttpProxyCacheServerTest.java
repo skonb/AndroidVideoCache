@@ -1,5 +1,6 @@
 package com.danikula.videocache;
 
+import android.net.Uri;
 import android.util.Pair;
 
 import com.danikula.android.garden.io.IoUtils;
@@ -7,14 +8,10 @@ import com.danikula.videocache.file.FileNameGenerator;
 import com.danikula.videocache.file.Md5FileNameGenerator;
 import com.danikula.videocache.support.ProxyCacheTestUtils;
 import com.danikula.videocache.support.Response;
-import com.danikula.videocache.test.BuildConfig;
 
 import org.junit.Before;
 import org.junit.Test;
-import org.junit.runner.RunWith;
-import org.robolectric.RobolectricGradleTestRunner;
 import org.robolectric.RuntimeEnvironment;
-import org.robolectric.annotation.Config;
 
 import java.io.File;
 import java.io.IOException;
@@ -33,6 +30,7 @@ import static com.danikula.videocache.support.ProxyCacheTestUtils.HTTP_DATA_URL_
 import static com.danikula.videocache.support.ProxyCacheTestUtils.HTTP_DATA_URL_6_REDIRECTS;
 import static com.danikula.videocache.support.ProxyCacheTestUtils.HTTP_DATA_URL_ONE_REDIRECT;
 import static com.danikula.videocache.support.ProxyCacheTestUtils.getFileContent;
+import static com.danikula.videocache.support.ProxyCacheTestUtils.getPort;
 import static com.danikula.videocache.support.ProxyCacheTestUtils.loadAssetFile;
 import static com.danikula.videocache.support.ProxyCacheTestUtils.readProxyResponse;
 import static org.fest.assertions.api.Assertions.assertThat;
@@ -40,9 +38,7 @@ import static org.fest.assertions.api.Assertions.assertThat;
 /**
  * @author Alexey Danilov (danikula@gmail.com).
  */
-@RunWith(RobolectricGradleTestRunner.class)
-@Config(constants = BuildConfig.class, emulateSdk = BuildConfig.MIN_SDK_VERSION)
-public class HttpProxyCacheServerTest {
+public class HttpProxyCacheServerTest extends BaseTest {
 
     private File cacheFolder;
 
@@ -208,6 +204,96 @@ public class HttpProxyCacheServerTest {
         assertThat(file(cacheFolder, HTTP_DATA_URL_3_REDIRECTS)).doesNotExist();
         assertThat(file(cacheFolder, HTTP_DATA_URL_ONE_REDIRECT)).exists();
         assertThat(file(cacheFolder, HTTP_DATA_URL_6_REDIRECTS)).exists();
+    }
+
+    @Test
+    public void testCheckFileExistForNotCachedUrl() throws Exception {
+        HttpProxyCacheServer proxy = newProxy(cacheFolder);
+        proxy.shutdown();
+        assertThat(proxy.isCached(HTTP_DATA_URL)).isFalse();
+    }
+
+    @Test
+    public void testCheckFileExistForFullyCachedUrl() throws Exception {
+        HttpProxyCacheServer proxy = newProxy(cacheFolder);
+        readProxyResponse(proxy, HTTP_DATA_URL, 0);
+        proxy.shutdown();
+
+        assertThat(proxy.isCached(HTTP_DATA_URL)).isTrue();
+    }
+
+    @Test
+    public void testCheckFileExistForPartiallyCachedUrl() throws Exception {
+        File cacheDir = RuntimeEnvironment.application.getExternalCacheDir();
+        File file = file(cacheDir, HTTP_DATA_URL);
+        int partialCacheSize = 1000;
+        byte[] partialData = ProxyCacheTestUtils.generate(partialCacheSize);
+        File partialCacheFile = ProxyCacheTestUtils.getTempFile(file);
+        IoUtils.saveToFile(partialData, partialCacheFile);
+
+        HttpProxyCacheServer proxy = newProxy(cacheDir);
+        assertThat(proxy.isCached(HTTP_DATA_URL)).isFalse();
+
+        readProxyResponse(proxy, HTTP_DATA_URL);
+        proxy.shutdown();
+
+        assertThat(proxy.isCached(HTTP_DATA_URL)).isTrue();
+    }
+
+    @Test
+    public void testCheckFileExistForDeletedCacheFile() throws Exception {
+        HttpProxyCacheServer proxy = newProxy(cacheFolder);
+        readProxyResponse(proxy, HTTP_DATA_URL, 0);
+        proxy.shutdown();
+        File cacheFile = file(cacheFolder, HTTP_DATA_URL);
+        boolean deleted = cacheFile.delete();
+
+        assertThat(deleted).isTrue();
+        assertThat(proxy.isCached(HTTP_DATA_URL)).isFalse();
+    }
+
+    @Test
+    public void testGetProxiedUrlForEmptyCache() throws Exception {
+        HttpProxyCacheServer proxy = newProxy(cacheFolder);
+        String expectedUrl = "http://127.0.0.1:" + getPort(proxy) + "/" + ProxyCacheUtils.encode(HTTP_DATA_URL);
+        assertThat(proxy.getProxyUrl(HTTP_DATA_URL)).isEqualTo(expectedUrl);
+        assertThat(proxy.getProxyUrl(HTTP_DATA_URL, true)).isEqualTo(expectedUrl);
+        assertThat(proxy.getProxyUrl(HTTP_DATA_URL, false)).isEqualTo(expectedUrl);
+        proxy.shutdown();
+    }
+
+    @Test
+    public void testGetProxiedUrlForPartialCache() throws Exception {
+        File cacheDir = RuntimeEnvironment.application.getExternalCacheDir();
+        File file = new File(cacheDir, new Md5FileNameGenerator().generate(HTTP_DATA_URL));
+        int partialCacheSize = 1000;
+        byte[] partialData = ProxyCacheTestUtils.generate(partialCacheSize);
+        File partialCacheFile = ProxyCacheTestUtils.getTempFile(file);
+        IoUtils.saveToFile(partialData, partialCacheFile);
+
+        HttpProxyCacheServer proxy = newProxy(cacheFolder);
+        String expectedUrl = "http://127.0.0.1:" + getPort(proxy) + "/" + ProxyCacheUtils.encode(HTTP_DATA_URL);
+
+        assertThat(proxy.getProxyUrl(HTTP_DATA_URL)).isEqualTo(expectedUrl);
+        assertThat(proxy.getProxyUrl(HTTP_DATA_URL, true)).isEqualTo(expectedUrl);
+        assertThat(proxy.getProxyUrl(HTTP_DATA_URL, false)).isEqualTo(expectedUrl);
+
+        proxy.shutdown();
+    }
+
+    @Test
+    public void testGetProxiedUrlForExistedCache() throws Exception {
+        HttpProxyCacheServer proxy = newProxy(cacheFolder);
+        readProxyResponse(proxy, HTTP_DATA_URL, 0);
+        String proxiedUrl = "http://127.0.0.1:" + getPort(proxy) + "/" + ProxyCacheUtils.encode(HTTP_DATA_URL);
+
+        File cachedFile = file(cacheFolder, HTTP_DATA_URL);
+        String cachedFileUri = Uri.fromFile(cachedFile).toString();
+        assertThat(proxy.getProxyUrl(HTTP_DATA_URL)).isEqualTo(cachedFileUri);
+        assertThat(proxy.getProxyUrl(HTTP_DATA_URL, true)).isEqualTo(cachedFileUri);
+        assertThat(proxy.getProxyUrl(HTTP_DATA_URL, false)).isEqualTo(proxiedUrl);
+
+        proxy.shutdown();
     }
 
     private Pair<File, Response> readProxyData(String url, int offset) throws IOException {

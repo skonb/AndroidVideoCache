@@ -1,37 +1,34 @@
 package com.danikula.videocache;
 
 import android.content.Context;
-import android.os.SystemClock;
-import android.util.Log;
+import android.net.Uri;
 
 import com.danikula.videocache.file.DiskUsage;
 import com.danikula.videocache.file.FileNameGenerator;
 import com.danikula.videocache.file.Md5FileNameGenerator;
 import com.danikula.videocache.file.TotalCountLruDiskUsage;
 import com.danikula.videocache.file.TotalSizeLruDiskUsage;
+import com.danikula.videocache.sourcestorage.SourceInfoStorage;
+import com.danikula.videocache.sourcestorage.SourceInfoStorageFactory;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.io.IOException;
-import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketException;
-import java.util.Arrays;
+import java.util.Locale;
 import java.util.Map;
-import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeoutException;
 
 import static com.danikula.videocache.Preconditions.checkAllNotNull;
 import static com.danikula.videocache.Preconditions.checkNotNull;
-import static com.danikula.videocache.ProxyCacheUtils.LOG_TAG;
-import static java.util.concurrent.TimeUnit.MILLISECONDS;
 
 /**
  * Simple lightweight proxy server with file caching support that handles HTTP requests.
@@ -54,9 +51,8 @@ import static java.util.concurrent.TimeUnit.MILLISECONDS;
  */
 public class HttpProxyCacheServer {
 
+    private static final Logger LOG = LoggerFactory.getLogger("HttpProxyCacheServer");
     private static final String PROXY_HOST = "127.0.0.1";
-    private static final String PING_REQUEST = "ping";
-    private static final String PING_RESPONSE = "ping ok";
 
     private final Object clientsLock = new Object();
     private final ExecutorService socketProcessor = Executors.newFixedThreadPool(8);
@@ -65,7 +61,7 @@ public class HttpProxyCacheServer {
     private final int port;
     private final Thread waitConnectionThread;
     private final Config config;
-    private boolean pinged;
+    private final Pinger pinger;
 
     public HttpProxyCacheServer(Context context) {
         this(new Builder(context).buildConfig());
@@ -81,65 +77,46 @@ public class HttpProxyCacheServer {
             this.waitConnectionThread = new Thread(new WaitRequestsRunnable(startSignal));
             this.waitConnectionThread.start();
             startSignal.await(); // freeze thread, wait for server starts
-            Log.i(LOG_TAG, "Proxy cache server started. Ping it...");
-            makeSureServerWorks();
+            this.pinger = new Pinger(PROXY_HOST, port);
+            LOG.info("Proxy cache server started. Is it alive? " + isAlive());
         } catch (IOException | InterruptedException e) {
             socketProcessor.shutdown();
             throw new IllegalStateException("Error starting local proxy server", e);
         }
     }
 
-    private void makeSureServerWorks() {
-        int maxPingAttempts = 3;
-        int delay = 300;
-        int pingAttempts = 0;
-        while (pingAttempts < maxPingAttempts) {
-            try {
-                Future<Boolean> pingFuture = socketProcessor.submit(new PingCallable());
-                this.pinged = pingFuture.get(delay, MILLISECONDS);
-                if (this.pinged) {
-                    return;
-                }
-                SystemClock.sleep(delay);
-            } catch (InterruptedException | ExecutionException | TimeoutException e) {
-                Log.e(LOG_TAG, "Error pinging server [attempt: " + pingAttempts + ", timeout: " + delay + "]. ", e);
-            }
-            pingAttempts++;
-            delay *= 2;
-        }
-        Log.e(LOG_TAG, "Shutdown server… Error pinging server [attempts: " + pingAttempts + ", max timeout: " + delay / 2 + "]. " +
-                "If you see this message, please, email me danikula@gmail.com");
-        shutdown();
-    }
-
-    private boolean pingServer() throws ProxyCacheException {
-        String pingUrl = appendToProxyUrl(PING_REQUEST);
-        HttpUrlSource source = new HttpUrlSource(pingUrl);
-        try {
-            byte[] expectedResponse = PING_RESPONSE.getBytes();
-            source.open(0);
-            byte[] response = new byte[expectedResponse.length];
-            source.read(response);
-            boolean pingOk = Arrays.equals(expectedResponse, response);
-            Log.d(LOG_TAG, "Ping response: `" + new String(response) + "`, pinged? " + pingOk);
-            return pingOk;
-        } catch (ProxyCacheException e) {
-            Log.e(LOG_TAG, "Error reading ping response", e);
-            return false;
-        } finally {
-            source.close();
-        }
-    }
-
+    /**
+     * Returns url that wrap original url and should be used for client (MediaPlayer, ExoPlayer, etc).
+     * <p>
+     * If file for this url is fully cached (it means method {@link #isCached(String)} returns {@code true})
+     * then file:// uri to cached file will be returned.
+     * <p>
+     * Calling this method has same effect as calling {@link #getProxyUrl(String, boolean)} with 2nd parameter set to {@code true}.
+     *
+     * @param url a url to file that should be cached.
+     * @return a wrapped by proxy url if file is not fully cached or url pointed to cache file otherwise.
+     */
     public String getProxyUrl(String url) {
-        if (!pinged) {
-            Log.e(LOG_TAG, "Proxy server isn't pinged. Caching doesn't work. If you see this message, please, email me danikula@gmail.com");
-        }
-        return pinged ? appendToProxyUrl(url) : url;
+        return getProxyUrl(url, true);
     }
 
-    private String appendToProxyUrl(String url) {
-        return String.format("http://%s:%d/%s", PROXY_HOST, port, ProxyCacheUtils.encode(url));
+    /**
+     * Returns url that wrap original url and should be used for client (MediaPlayer, ExoPlayer, etc).
+     * <p>
+     * If parameter {@code allowCachedFileUri} is {@code true} and file for this url is fully cached
+     * (it means method {@link #isCached(String)} returns {@code true}) then file:// uri to cached file will be returned.
+     *
+     * @param url                a url to file that should be cached.
+     * @param allowCachedFileUri {@code true} if allow to return file:// uri if url is fully cached
+     * @return a wrapped by proxy url if file is not fully cached or url pointed to cache file otherwise (if {@code allowCachedFileUri} is {@code true}).
+     */
+    public String getProxyUrl(String url, boolean allowCachedFileUri) {
+        if (allowCachedFileUri && isCached(url)) {
+            File cacheFile = getCacheFile(url);
+            touchFileSafely(cacheFile);
+            return Uri.fromFile(cacheFile).toString();
+        }
+        return isAlive() ? appendToProxyUrl(url) : url;
     }
 
     public void registerCacheListener(CacheListener cacheListener, String url) {
@@ -148,7 +125,7 @@ public class HttpProxyCacheServer {
             try {
                 getClients(url).registerCacheListener(cacheListener);
             } catch (ProxyCacheException e) {
-                Log.d(LOG_TAG, "Error registering cache listener", e);
+                LOG.warn("Error registering cache listener", e);
             }
         }
     }
@@ -159,7 +136,7 @@ public class HttpProxyCacheServer {
             try {
                 getClients(url).unregisterCacheListener(cacheListener);
             } catch (ProxyCacheException e) {
-                Log.d(LOG_TAG, "Error registering cache listener", e);
+                LOG.warn("Error registering cache listener", e);
             }
         }
     }
@@ -173,10 +150,23 @@ public class HttpProxyCacheServer {
         }
     }
 
+    /**
+     * Checks is cache contains fully cached file for particular url.
+     *
+     * @param url an url cache file will be checked for.
+     * @return {@code true} if cache contains fully cached file for passed in parameters url.
+     */
+    public boolean isCached(String url) {
+        checkNotNull(url, "Url can't be null!");
+        return getCacheFile(url).exists();
+    }
+
     public void shutdown() {
-        Log.i(LOG_TAG, "Shutdown proxy server");
+        LOG.info("Shutdown proxy server");
 
         shutdownClients();
+
+        config.sourceInfoStorage.release();
 
         waitConnectionThread.interrupt();
         try {
@@ -185,6 +175,28 @@ public class HttpProxyCacheServer {
             }
         } catch (IOException e) {
             onError(new ProxyCacheException("Error shutting down proxy server", e));
+        }
+    }
+
+    private boolean isAlive() {
+        return pinger.ping(3, 70);   // 70+140+280=max~500ms
+    }
+
+    private String appendToProxyUrl(String url) {
+        return String.format(Locale.US, "http://%s:%d/%s", PROXY_HOST, port, ProxyCacheUtils.encode(url));
+    }
+
+    public File getCacheFile(String url) {
+        File cacheDir = config.cacheRoot;
+        String fileName = config.fileNameGenerator.generate(url);
+        return new File(cacheDir, fileName);
+    }
+
+    private void touchFileSafely(File cacheFile) {
+        try {
+            config.diskUsage.touch(cacheFile);
+        } catch (IOException e) {
+            LOG.error("Error touching file " + cacheFile, e);
         }
     }
 
@@ -201,7 +213,7 @@ public class HttpProxyCacheServer {
         try {
             while (!Thread.currentThread().isInterrupted()) {
                 Socket socket = serverSocket.accept();
-                Log.d(LOG_TAG, "Accept new socket " + socket);
+                LOG.debug("Accept new socket " + socket);
                 socketProcessor.submit(new SocketProcessorRunnable(socket));
             }
         } catch (IOException e) {
@@ -212,10 +224,10 @@ public class HttpProxyCacheServer {
     private void processSocket(Socket socket) {
         try {
             GetRequest request = GetRequest.read(socket.getInputStream());
-            Log.i(LOG_TAG, "Request to cache proxy:" + request);
+            LOG.debug("Request to cache proxy:" + request);
             String url = ProxyCacheUtils.decode(request.uri);
-            if (PING_REQUEST.equals(url)) {
-                responseToPing(socket);
+            if (pinger.isPingRequest(url)) {
+                pinger.responseToPing(socket);
             } else {
                 HttpProxyCacheServerClients clients = getClients(url);
                 clients.processRequest(request, socket);
@@ -223,19 +235,13 @@ public class HttpProxyCacheServer {
         } catch (SocketException e) {
             // There is no way to determine that client closed connection http://stackoverflow.com/a/10241044/999458
             // So just to prevent log flooding don't log stacktrace
-            Log.d(LOG_TAG, "Closing socket… Socket is closed by client.");
+            LOG.debug("Closing socket… Socket is closed by client.");
         } catch (ProxyCacheException | IOException e) {
             onError(new ProxyCacheException("Error processing request", e));
         } finally {
             releaseSocket(socket);
-            Log.d(LOG_TAG, "Opened connections: " + getClientsCount());
+            LOG.debug("Opened connections: " + getClientsCount());
         }
-    }
-
-    private void responseToPing(Socket socket) throws IOException {
-        OutputStream out = socket.getOutputStream();
-        out.write("HTTP/1.1 200 OK\n\n".getBytes());
-        out.write(PING_RESPONSE.getBytes());
     }
 
     private HttpProxyCacheServerClients getClients(String url) throws ProxyCacheException {
@@ -273,7 +279,7 @@ public class HttpProxyCacheServer {
         } catch (SocketException e) {
             // There is no way to determine that client closed connection http://stackoverflow.com/a/10241044/999458
             // So just to prevent log flooding don't log stacktrace
-            Log.d(LOG_TAG, "Releasing input stream… Socket is closed by client.");
+            LOG.debug("Releasing input stream… Socket is closed by client.");
         } catch (IOException e) {
             onError(new ProxyCacheException("Error closing socket input stream", e));
         }
@@ -281,7 +287,7 @@ public class HttpProxyCacheServer {
 
     private void closeSocketOutput(Socket socket) {
         try {
-            if (socket.isOutputShutdown()) {
+            if (!socket.isOutputShutdown()) {
                 socket.shutdownOutput();
             }
         } catch (IOException e) {
@@ -300,7 +306,7 @@ public class HttpProxyCacheServer {
     }
 
     private void onError(Throwable e) {
-        Log.e(LOG_TAG, "HttpProxyCacheServer error", e);
+        LOG.error("HttpProxyCacheServer error", e);
     }
 
     private final class WaitRequestsRunnable implements Runnable {
@@ -332,14 +338,6 @@ public class HttpProxyCacheServer {
         }
     }
 
-    private class PingCallable implements Callable<Boolean> {
-
-        @Override
-        public Boolean call() throws Exception {
-            return pingServer();
-        }
-    }
-
     /**
      * Builder for {@link HttpProxyCacheServer}.
      */
@@ -350,8 +348,10 @@ public class HttpProxyCacheServer {
         private File cacheRoot;
         private FileNameGenerator fileNameGenerator;
         private DiskUsage diskUsage;
+        private SourceInfoStorage sourceInfoStorage;
 
         public Builder(Context context) {
+            this.sourceInfoStorage = SourceInfoStorageFactory.newSourceInfoStorage(context);
             this.cacheRoot = StorageUtils.getIndividualCacheDirectory(context);
             this.diskUsage = new TotalSizeLruDiskUsage(DEFAULT_MAX_SIZE);
             this.fileNameGenerator = new Md5FileNameGenerator();
@@ -425,7 +425,7 @@ public class HttpProxyCacheServer {
         }
 
         private Config buildConfig() {
-            return new Config(cacheRoot, fileNameGenerator, diskUsage);
+            return new Config(cacheRoot, fileNameGenerator, diskUsage, sourceInfoStorage);
         }
 
     }
